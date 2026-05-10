@@ -1,6 +1,8 @@
 /**
  * StreamPeak — Stremio Addon
  *
+ * Optional debrid support: /provider=value/manifest.json (e.g. /torbox=key/)
+ *
  * Fetches all streams from Torrentio, scores every stream across eight
  * dimensions (resolution, release type, HDR, audio, encoding, seeders, file
  * size sanity, release-group bonus), discards CAM/TS entries, buckets the
@@ -31,6 +33,88 @@ const MANIFEST = {
 		signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..F8mYf_QjIQ2UrNQuUW5LEg.RdTsUe28jg_cvhCj1aHYxON696q46tnoFYPu6Zi1gxq4bs6bbTjVNU67mpgzpvUrTQ9onFVmvHIbYN4dXqFVuXbRgolmUPHPmPDY2Pc-Ko0hOWe9s64_sYtxRjQFuh59.Sq8z-U-w1j7td5eyZS4kBg",
 	},
 };
+
+// ---------------------------------------------------------------------------
+// Debrid Support
+// ---------------------------------------------------------------------------
+
+/**
+ * Supported debrid providers - maps provider key to Torrentio parameter name.
+ * All providers supported by Torrentio are supported here.
+ */
+const DEBRID_PROVIDERS = {
+	torbox: "torbox",
+	realdebrid: "realdebrid",
+	premiumize: "premiumize",
+	alldebrid: "alldebrid",
+	debridlink: "debridlink",
+	easydebrid: "easydebrid",
+	offcloud: "offcloud",
+	putio: "putio",
+};
+
+/**
+ * Parse debrid configuration from URL path segment.
+ * Expected format: /provider=value/... or /provider=value
+ * Returns: { provider: string, value: string } or null if no debrid config found
+ */
+function parseDebridConfig(pathname) {
+	const match = pathname.match(/\/([a-zA-Z]+)=([^/]+)/);
+	if (!match) return null;
+	return { provider: match[1].toLowerCase(), value: match[2] };
+}
+
+/**
+ * Extract debrid config from pathname and return clean path without it.
+ * Returns: { debridConfig: object|null, cleanPath: string }
+ */
+function extractDebridConfigFromPath(pathname) {
+	const config = parseDebridConfig(pathname);
+	if (!config) return { debridConfig: null, cleanPath: pathname };
+	const cleanPath = pathname.replace(/\/[a-zA-Z]+=[^/]+/, "");
+	return { debridConfig: config, cleanPath };
+}
+
+/**
+ * Build Torrentio base URL with optional debrid configuration.
+ * Torrentio expects debrid config as a path segment: /provider=value/
+ */
+function buildTorrentioBaseUrl(baseUrl, debridConfig) {
+	if (!debridConfig) return baseUrl;
+	const providerParam = DEBRID_PROVIDERS[debridConfig.provider] || debridConfig.provider;
+	return `${baseUrl}/${providerParam}=${encodeURIComponent(debridConfig.value)}`;
+}
+
+/**
+ * Get human-readable display name for a debrid provider.
+ */
+function getProviderDisplayName(providerKey) {
+	const names = {
+		torbox: "TorBox",
+		realdebrid: "Real-Debrid",
+		premiumize: "Premiumize",
+		alldebrid: "AllDebrid",
+		debridlink: "DebridLink",
+		easydebrid: "EasyDebrid",
+		offcloud: "OffCloud",
+		putio: "Put.io",
+	};
+	const key = providerKey?.toLowerCase();
+	return names[key] || (key ? key.charAt(0).toUpperCase() + key.slice(1) : "Debrid");
+}
+
+/**
+ * Build manifest with optional debrid provider customization.
+ */
+function buildManifest(debridConfig) {
+	const manifest = { ...MANIFEST };
+	if (debridConfig) {
+		const providerName = getProviderDisplayName(debridConfig.provider);
+		manifest.name = `StreamPeak (${providerName})`;
+		manifest.description = `Stop guessing which stream to pick. StreamPeak analyzes every available stream and surfaces only the best. With ${providerName} debrid support.`;
+	}
+	return manifest;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -560,13 +644,14 @@ function selectBestStreams(rawStreams) {
  * falls back to the secondary instance.
  * Returns an empty array only if both fail — the Worker must never crash.
  */
-async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT) {
+async function fetchTorrentioStreams(type, id, torrentioBase = TORRENTIO_DEFAULT, debridConfig = null) {
 	const path = `/stream/${type}/${id}.json`;
 	const bases = [torrentioBase];
 	if (torrentioBase !== TORRENTIO_FALLBACK) bases.push(TORRENTIO_FALLBACK);
 
 	for (const base of bases) {
-		const url = `${base}${path}`;
+		const effectiveBase = debridConfig ? buildTorrentioBaseUrl(base, debridConfig) : base;
+		const url = `${effectiveBase}${path}`;
 		try {
 			const response = await fetch(url, {
 				signal: AbortSignal.timeout(8_000),
@@ -657,21 +742,26 @@ function buildCachedResponse(streams) {
 /**
  * Handles:
  *   GET  /manifest.json
+ *   GET  /[debrid-config]/manifest.json  (e.g., /torbox=key/manifest.json)
  *   GET  /stream/movie/:id.json
+ *   GET  /[debrid-config]/stream/movie/:id.json
  *   GET  /stream/series/:id.json
+ *   GET  /[debrid-config]/stream/series/:id.json
  *   GET  /debug/movie/:id
  *   GET  /debug/series/:id
  *   OPTIONS *  (CORS pre-flight)
  *   GET  /  (redirect → /manifest.json)
  */
-async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
+async function handleStreamRoute(request, ctx, type, id, torrentioBase, debridConfig = null) {
 	if (!/^tt\d+(:\d+:\d+)?$/.test(id)) {
 		return jsonResponse({ streams: [] }, 200, 60);
 	}
 
 	const cache = caches.default;
+	// Include debrid config in cache key for isolation
+	const cacheKeySuffix = debridConfig ? `/${debridConfig.provider}=${debridConfig.value}` : "";
 	const cacheKey = new Request(
-		`${new URL(request.url).origin}/stream/${type}/${id}.json`,
+		`${new URL(request.url).origin}/stream/${type}/${id}.json${cacheKeySuffix}`,
 	);
 	const cached = await cache.match(cacheKey);
 
@@ -682,7 +772,7 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
 
 		if (age > softTtl && ctx) {
 			ctx.waitUntil((async () => {
-				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+				const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase, debridConfig);
 				const fresh = buildCachedResponse(selectBestStreams(rawStreams));
 				await cache.put(cacheKey, fresh);
 			})());
@@ -694,17 +784,17 @@ async function handleStreamRoute(request, ctx, type, id, torrentioBase) {
 		});
 	}
 
-	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase, debridConfig);
 	const response = buildCachedResponse(selectBestStreams(rawStreams));
 	if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
 	return response;
 }
 
-async function handleDebugRoute(searchParams, type, id, torrentioBase, debugKey) {
+async function handleDebugRoute(searchParams, type, id, torrentioBase, debugKey, debridConfig = null) {
 	if (debugKey && searchParams.get("key") !== debugKey) {
 		return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
 	}
-	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase);
+	const rawStreams = await fetchTorrentioStreams(type, id, torrentioBase, debridConfig);
 	const { debugInfo } = analyseStreams(rawStreams);
 	return jsonResponse(debugInfo, 200, 0, true);
 }
@@ -713,6 +803,9 @@ async function handleRequest(request, ctx, env = {}) {
 	const { pathname, searchParams } = new URL(request.url);
 	const torrentioBase = env.TORRENTIO_URL ?? TORRENTIO_DEFAULT;
 
+	// Extract debrid config from path (e.g., /torbox=key/manifest.json)
+	const { debridConfig, cleanPath } = extractDebridConfigFromPath(pathname);
+
 	if (request.method === "OPTIONS") {
 		return new Response(null, { status: 204, headers: CORS_HEADERS });
 	}
@@ -720,23 +813,23 @@ async function handleRequest(request, ctx, env = {}) {
 		return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
 	}
 
-	if (pathname === "/manifest.json") {
-		return jsonResponse(MANIFEST, 200, 86400);
+	if (cleanPath === "/manifest.json") {
+		return jsonResponse(buildManifest(debridConfig), 200, 86400);
 	}
 
-	const streamMatch = /^\/stream\/(movie|series)\/([^/]+)\.json$/.exec(pathname);
+	const streamMatch = /^\/stream\/(movie|series)\/([^/]+)\.json$/.exec(cleanPath);
 	if (streamMatch) {
 		const [, type, id] = streamMatch;
-		return handleStreamRoute(request, ctx, type, decodeURIComponent(id), torrentioBase);
+		return handleStreamRoute(request, ctx, type, decodeURIComponent(id), torrentioBase, debridConfig);
 	}
 
-	const debugMatch = /^\/debug\/(movie|series)\/([^/]+)$/.exec(pathname);
+	const debugMatch = /^\/debug\/(movie|series)\/([^/]+)$/.exec(cleanPath);
 	if (debugMatch) {
 		const [, type, id] = debugMatch;
-		return handleDebugRoute(searchParams, type, decodeURIComponent(id), torrentioBase, env.DEBUG_KEY);
+		return handleDebugRoute(searchParams, type, decodeURIComponent(id), torrentioBase, env.DEBUG_KEY, debridConfig);
 	}
 
-	if (pathname === "/" || pathname === "") {
+	if (cleanPath === "/" || cleanPath === "") {
 		return new Response(null, {
 			status: 302,
 			headers: { ...CORS_HEADERS, Location: "/manifest.json" },
@@ -777,4 +870,11 @@ export {
 	fetchTorrentioStreams,
 	handleRequest,
 	MANIFEST,
+	// Debrid support
+	DEBRID_PROVIDERS,
+	parseDebridConfig,
+	extractDebridConfigFromPath,
+	buildTorrentioBaseUrl,
+	getProviderDisplayName,
+	buildManifest,
 };
